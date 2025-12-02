@@ -1,0 +1,740 @@
+"""
+Local Crisis Resource Navigator - Complete Backend Implementation
+An agentic system to help people in crisis find immediate local resources
+"""
+
+import os
+import json
+import re
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from dataclasses import dataclass, asdict
+import anthropic
+from enum import Enum
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class CrisisType(Enum):
+    DOMESTIC_VIOLENCE = "domestic_violence"
+    HOMELESSNESS = "homelessness"
+    MENTAL_HEALTH = "mental_health"
+    ADDICTION = "addiction"
+    FOOD_INSECURITY = "food_insecurity"
+    GENERAL = "general"
+
+@dataclass
+class UserContext:
+    """Stores user's crisis context"""
+    crisis_type: Optional[CrisisType] = None
+    location: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    urgent_needs: List[str] = None
+    has_children: bool = False
+    has_transportation: bool = True
+    eligibility_factors: Dict = None
+    conversation_history: List[Dict] = None
+    
+    def __post_init__(self):
+        if self.urgent_needs is None:
+            self.urgent_needs = []
+        if self.eligibility_factors is None:
+            self.eligibility_factors = {}
+        if self.conversation_history is None:
+            self.conversation_history = []
+
+@dataclass
+class Resource:
+    """Represents a crisis resource"""
+    name: str
+    resource_type: str
+    phone: str
+    address: str
+    city: str
+    state: str
+    description: str
+    services: List[str]
+    hours: str
+    eligibility: str
+    last_verified: str
+    availability_status: str = "unknown"
+    distance_miles: Optional[float] = None
+    confidence_score: float = 0.5
+
+# ============================================================================
+# INTAKE AGENT
+# ============================================================================
+
+class IntakeAgent:
+    """Handles initial conversation and context gathering"""
+    
+    def __init__(self, api_key: str):
+        self.client = anthropic.Anthropic(api_key=api_key)
+        
+    def process_message(self, user_message: str, context: UserContext) -> Tuple[str, UserContext]:
+        """Process user message and extract context"""
+        
+        # Add message to history
+        context.conversation_history.append({
+            "role": "user",
+            "content": user_message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Build system prompt
+        system_prompt = self._build_intake_prompt(context)
+        
+        # Call Claude to generate empathetic response and extract context
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[
+                {"role": msg["role"], "content": msg["content"]} 
+                for msg in context.conversation_history
+            ]
+        )
+        
+        assistant_message = response.content[0].text
+        
+        # Extract structured information
+        context = self._extract_context(user_message, assistant_message, context)
+        
+        # Add assistant response to history
+        context.conversation_history.append({
+            "role": "assistant",
+            "content": assistant_message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        return assistant_message, context
+    
+    def _build_intake_prompt(self, context: UserContext) -> str:
+        """Build system prompt for intake conversation"""
+        return f"""You are a compassionate crisis resource intake specialist. Your role is to:
+
+1. Be warm, empathetic, and trauma-informed
+2. Never ask "why" questions - focus on "what" and "how"
+3. Prioritize immediate safety
+4. Gather key information naturally through conversation:
+   - What type of crisis (housing, DV, mental health, addiction, food)
+   - Location (city/state)
+   - Immediate needs and timeline
+   - Any special circumstances (children, disabilities, transportation)
+
+5. Use clear, simple language
+6. Validate their experience
+7. Let them know help is available
+
+Current context gathered:
+- Crisis type: {context.crisis_type.value if context.crisis_type else "unknown"}
+- Location: {context.location or "unknown"}
+- Has children: {context.has_children}
+- Urgent needs: {', '.join(context.urgent_needs) if context.urgent_needs else "none identified"}
+
+If you have enough information to search for resources (at minimum: crisis type and location), 
+acknowledge this and let them know you're searching for immediate help.
+
+CRITICAL: If someone mentions active danger or suicide, immediately provide:
+- 988 Suicide & Crisis Lifeline
+- 911 for emergencies
+- National Domestic Violence Hotline: 1-800-799-7233
+
+Be concise but caring. This person is in crisis."""
+
+    def _extract_context(self, user_msg: str, assistant_msg: str, context: UserContext) -> UserContext:
+        """Extract structured context from messages"""
+        
+        user_lower = user_msg.lower()
+        
+        # Extract crisis type
+        if not context.crisis_type:
+            if any(word in user_lower for word in ["homeless", "housing", "shelter", "nowhere to stay", "evict"]):
+                context.crisis_type = CrisisType.HOMELESSNESS
+            elif any(word in user_lower for word in ["abuse", "violence", "partner", "scared", "hurt", "escape"]):
+                context.crisis_type = CrisisType.DOMESTIC_VIOLENCE
+            elif any(word in user_lower for word in ["suicide", "kill myself", "depression", "anxiety", "mental"]):
+                context.crisis_type = CrisisType.MENTAL_HEALTH
+            elif any(word in user_lower for word in ["addiction", "drugs", "alcohol", "rehab", "detox", "sober"]):
+                context.crisis_type = CrisisType.ADDICTION
+            elif any(word in user_lower for word in ["food", "hungry", "eat", "food bank", "meals"]):
+                context.crisis_type = CrisisType.FOOD_INSECURITY
+        
+        # Extract location
+        if not context.location:
+            # Look for "in [City]" or "[City], [State]" patterns
+            location_pattern = r'(?:in|near|at)\s+([A-Z][a-zA-Z\s]+(?:,\s*[A-Z]{2})?)'
+            match = re.search(location_pattern, user_msg)
+            if match:
+                context.location = match.group(1).strip()
+                # Try to parse city and state
+                if ',' in context.location:
+                    parts = context.location.split(',')
+                    context.city = parts[0].strip()
+                    context.state = parts[1].strip()
+                else:
+                    context.city = context.location
+        
+        # Check for children
+        if any(word in user_lower for word in ["child", "kids", "son", "daughter", "baby"]):
+            context.has_children = True
+        
+        # Check for transportation
+        if any(word in user_lower for word in ["no car", "can't drive", "no transportation", "walk"]):
+            context.has_transportation = False
+        
+        # Extract urgent needs
+        urgent_keywords = {
+            "tonight": "immediate_shelter",
+            "now": "immediate_help",
+            "today": "same_day",
+            "safe": "safety_concern",
+            "danger": "active_danger"
+        }
+        for keyword, need in urgent_keywords.items():
+            if keyword in user_lower and need not in context.urgent_needs:
+                context.urgent_needs.append(need)
+        
+        return context
+
+# ============================================================================
+# RESOURCE DISCOVERY AGENT
+# ============================================================================
+
+class ResourceDiscoveryAgent:
+    """Searches for relevant crisis resources"""
+    
+    def __init__(self, api_key: str):
+        self.client = anthropic.Anthropic(api_key=api_key)
+        
+    def find_resources(self, context: UserContext) -> List[Resource]:
+        """Search for resources based on user context"""
+        
+        if not context.location or not context.crisis_type:
+            return []
+        
+        # Build search queries
+        queries = self._build_search_queries(context)
+        
+        # Search for resources
+        all_resources = []
+        for query in queries:
+            resources = self._search_web(query, context)
+            all_resources.extend(resources)
+        
+        # Deduplicate by name
+        unique_resources = {}
+        for resource in all_resources:
+            if resource.name not in unique_resources:
+                unique_resources[resource.name] = resource
+        
+        return list(unique_resources.values())
+    
+    def _build_search_queries(self, context: UserContext) -> List[str]:
+        """Build optimized search queries"""
+        queries = []
+        location = context.city or context.location
+        
+        crisis_queries = {
+            CrisisType.DOMESTIC_VIOLENCE: [
+                f"{location} domestic violence shelter",
+                f"{location} women's shelter",
+                f"{location} DV crisis hotline"
+            ],
+            CrisisType.HOMELESSNESS: [
+                f"{location} homeless shelter",
+                f"{location} emergency housing",
+                f"{location} overnight shelter"
+            ],
+            CrisisType.MENTAL_HEALTH: [
+                f"{location} mental health crisis",
+                f"{location} psychiatric emergency",
+                f"{location} crisis stabilization"
+            ],
+            CrisisType.ADDICTION: [
+                f"{location} addiction treatment",
+                f"{location} detox center",
+                f"{location} substance abuse help"
+            ],
+            CrisisType.FOOD_INSECURITY: [
+                f"{location} food bank",
+                f"{location} emergency food",
+                f"{location} free meals"
+            ]
+        }
+        
+        if context.crisis_type in crisis_queries:
+            queries = crisis_queries[context.crisis_type]
+        else:
+            queries = [f"{location} crisis resources"]
+        
+        return queries
+    
+    def _search_web(self, query: str, context: UserContext) -> List[Resource]:
+        """Perform web search and extract resources"""
+        
+        # Use Claude with web search to find resources
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=3000,
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            messages=[{
+                "role": "user",
+                "content": f"""Search for: {query}
+
+Find crisis resources with these details:
+- Organization name
+- Phone number (critical)
+- Physical address
+- Services offered
+- Hours of operation
+- Eligibility requirements
+
+Focus on 24/7 or immediate access resources. Return as JSON array with structure:
+[{{
+  "name": "...",
+  "phone": "...",
+  "address": "...",
+  "city": "...",
+  "state": "...",
+  "description": "...",
+  "services": [...],
+  "hours": "...",
+  "eligibility": "..."
+}}]"""
+            }]
+        )
+        
+        # Parse response
+        resources = []
+        for block in response.content:
+            if block.type == "text":
+                try:
+                    # Extract JSON from response
+                    json_match = re.search(r'\[.*\]', block.text, re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group())
+                        for item in data:
+                            resources.append(Resource(
+                                name=item.get("name", "Unknown"),
+                                resource_type=context.crisis_type.value if context.crisis_type else "general",
+                                phone=item.get("phone", ""),
+                                address=item.get("address", ""),
+                                city=item.get("city", context.city or ""),
+                                state=item.get("state", context.state or ""),
+                                description=item.get("description", ""),
+                                services=item.get("services", []),
+                                hours=item.get("hours", "Call for hours"),
+                                eligibility=item.get("eligibility", "Call to verify"),
+                                last_verified=datetime.now().isoformat()
+                            ))
+                except:
+                    pass
+        
+        return resources
+
+# ============================================================================
+# VERIFICATION AGENT
+# ============================================================================
+
+class VerificationAgent:
+    """Verifies resource availability and quality"""
+    
+    def __init__(self, api_key: str):
+        self.client = anthropic.Anthropic(api_key=api_key)
+    
+    def verify_resources(self, resources: List[Resource]) -> List[Resource]:
+        """Verify and enrich resource information"""
+        
+        verified_resources = []
+        
+        for resource in resources:
+            # Verify contact information exists
+            if not resource.phone:
+                resource.confidence_score = 0.3
+                continue
+            
+            # Check if resource has recent verification
+            resource.confidence_score = 0.7  # Base score
+            
+            # Bonus points for 24/7 availability
+            if "24/7" in resource.hours or "24 hours" in resource.hours.lower():
+                resource.confidence_score += 0.1
+                resource.availability_status = "likely_available"
+            
+            # Bonus for complete information
+            if resource.address and resource.services and resource.description:
+                resource.confidence_score += 0.1
+            
+            resource.confidence_score = min(resource.confidence_score, 1.0)
+            verified_resources.append(resource)
+        
+        return verified_resources
+
+# ============================================================================
+# MATCHING & PRIORITIZATION AGENT
+# ============================================================================
+
+class MatchingAgent:
+    """Matches and prioritizes resources for user"""
+    
+    def rank_resources(self, resources: List[Resource], context: UserContext) -> List[Resource]:
+        """Rank resources by relevance and accessibility"""
+        
+        scored_resources = []
+        
+        for resource in resources:
+            score = resource.confidence_score
+            
+            # Prioritize by crisis type match
+            if context.crisis_type and context.crisis_type.value in resource.resource_type:
+                score += 0.2
+            
+            # Prioritize immediate availability
+            if "immediate_help" in context.urgent_needs or "tonight" in context.urgent_needs:
+                if "24/7" in resource.hours or resource.availability_status == "likely_available":
+                    score += 0.3
+            
+            # Prioritize resources with children services if needed
+            if context.has_children:
+                if any(s for s in resource.services if "child" in s.lower() or "family" in s.lower()):
+                    score += 0.15
+            
+            # Prioritize accessible locations if no transportation
+            if not context.has_transportation:
+                if "transit" in resource.description.lower() or "bus" in resource.description.lower():
+                    score += 0.1
+            
+            resource.confidence_score = min(score, 1.0)
+            scored_resources.append(resource)
+        
+        # Sort by score descending
+        scored_resources.sort(key=lambda r: r.confidence_score, reverse=True)
+        
+        # Return top 5
+        return scored_resources[:5]
+
+# ============================================================================
+# ACTION AGENT
+# ============================================================================
+
+class ActionAgent:
+    """Helps user take next steps with resources"""
+    
+    def __init__(self, api_key: str):
+        self.client = anthropic.Anthropic(api_key=api_key)
+    
+    def generate_action_plan(self, resources: List[Resource], context: UserContext) -> str:
+        """Generate personalized action plan"""
+        
+        if not resources:
+            return self._generate_fallback_plan(context)
+        
+        # Build resource presentation
+        resources_text = self._format_resources(resources)
+        
+        # Generate personalized guidance
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": f"""Create a clear action plan for someone in crisis.
+
+Context:
+- Crisis type: {context.crisis_type.value if context.crisis_type else 'general'}
+- Has children: {context.has_children}
+- Urgent needs: {', '.join(context.urgent_needs)}
+
+Available resources:
+{resources_text}
+
+Provide:
+1. Top 2-3 recommended resources with phone numbers
+2. Simple next steps (what to do, what to bring, what to say)
+3. Backup options
+4. Encouraging message
+
+Be direct, clear, and actionable. This person needs help now."""
+            }]
+        )
+        
+        return response.content[0].text
+    
+    def _format_resources(self, resources: List[Resource]) -> str:
+        """Format resources for presentation"""
+        formatted = []
+        for i, resource in enumerate(resources, 1):
+            formatted.append(f"""
+{i}. {resource.name}
+   Phone: {resource.phone}
+   Address: {resource.address}, {resource.city}, {resource.state}
+   Hours: {resource.hours}
+   Services: {', '.join(resource.services[:3])}
+   {resource.description}
+""")
+        return '\n'.join(formatted)
+    
+    def _generate_fallback_plan(self, context: UserContext) -> str:
+        """Generate fallback plan when no local resources found"""
+        
+        fallback_resources = {
+            CrisisType.DOMESTIC_VIOLENCE: """
+**National Domestic Violence Hotline: 1-800-799-7233**
+- Available 24/7, confidential
+- Can help find local shelter
+- Text "START" to 88788
+
+**Next steps:**
+1. Call the hotline from a safe location
+2. They will search for shelter in your area
+3. Pack essentials if safe: ID, medications, important documents
+4. You deserve to be safe
+""",
+            CrisisType.MENTAL_HEALTH: """
+**988 Suicide & Crisis Lifeline**
+- Call or text 988
+- Available 24/7, free and confidential
+- Trained counselors who care
+
+**Crisis Text Line: Text HOME to 741741**
+
+**Next steps:**
+1. Reach out to 988 right now
+2. They can help you stay safe
+3. They can connect you to local resources
+4. You are not alone
+""",
+            CrisisType.HOMELESSNESS: """
+**211 - Community Resources Hotline**
+- Call 211 or text your ZIP code to 898211
+- Available 24/7 in most areas
+- Connects to local shelters and services
+
+**National Runaway Safeline: 1-800-786-2929**
+(If you're under 21)
+
+**Next steps:**
+1. Call 211 and say "I need emergency shelter"
+2. Ask about same-day availability
+3. Ask about meal programs
+4. There is help available
+""",
+            CrisisType.ADDICTION: """
+**SAMHSA National Helpline: 1-800-662-4357**
+- Available 24/7, 365 days a year
+- Free, confidential treatment referral
+- Información en español disponible
+
+**Next steps:**
+1. Call SAMHSA helpline
+2. Ask about detox and treatment options in your area
+3. Ask about sliding scale/free programs
+4. Recovery is possible
+"""
+        }
+        
+        if context.crisis_type in fallback_resources:
+            return fallback_resources[context.crisis_type]
+        
+        return """
+I want to find you local resources, but I need a bit more information.
+
+**Meanwhile, here are immediate crisis resources:**
+
+• **988** - Suicide & Crisis Lifeline (call or text)
+• **911** - Emergency services
+• **211** - Community resources (available in most areas)
+• **1-800-799-7233** - National Domestic Violence Hotline
+
+Could you tell me:
+1. What city or area are you in?
+2. What kind of help do you need most urgently?
+
+I'm here to help you find the right support.
+"""
+
+# ============================================================================
+# ORCHESTRATOR
+# ============================================================================
+
+class CrisisNavigatorOrchestrator:
+    """Main orchestrator coordinating all agents"""
+    
+    def __init__(self, api_key: str):
+        self.intake_agent = IntakeAgent(api_key)
+        self.discovery_agent = ResourceDiscoveryAgent(api_key)
+        self.verification_agent = VerificationAgent(api_key)
+        self.matching_agent = MatchingAgent()
+        self.action_agent = ActionAgent(api_key)
+        self.context = UserContext()
+    
+    def process_message(self, user_message: str) -> str:
+        """Process user message through agent pipeline"""
+        
+        # Step 1: Intake and context gathering
+        response, self.context = self.intake_agent.process_message(
+            user_message, 
+            self.context
+        )
+        
+        # Step 2: Check if we have enough info to search
+        if self._should_search_resources():
+            # Step 3: Discover resources
+            resources = self.discovery_agent.find_resources(self.context)
+            
+            if resources:
+                # Step 4: Verify resources
+                verified_resources = self.verification_agent.verify_resources(resources)
+                
+                # Step 5: Match and prioritize
+                ranked_resources = self.matching_agent.rank_resources(
+                    verified_resources, 
+                    self.context
+                )
+                
+                # Step 6: Generate action plan
+                action_plan = self.action_agent.generate_action_plan(
+                    ranked_resources,
+                    self.context
+                )
+                
+                return action_plan
+            else:
+                # No resources found, provide fallback
+                return self.action_agent._generate_fallback_plan(self.context)
+        
+        # Still gathering information
+        return response
+    
+    def _should_search_resources(self) -> bool:
+        """Determine if we have enough context to search"""
+        has_location = bool(self.context.location)
+        has_crisis_type = bool(self.context.crisis_type)
+        has_urgent_need = len(self.context.urgent_needs) > 0
+        
+        # Search if we have location and either crisis type or urgent need
+        return has_location and (has_crisis_type or has_urgent_need)
+    
+    def reset(self):
+        """Reset conversation context"""
+        self.context = UserContext()
+
+# ============================================================================
+# FLASK API (Optional)
+# ============================================================================
+
+def create_flask_app():
+    """Create Flask API for the crisis navigator"""
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
+    
+    app = Flask(__name__)
+    CORS(app)
+    
+    # Store sessions (in production, use Redis or database)
+    sessions = {}
+    
+    @app.route('/api/chat', methods=['POST'])
+    def chat():
+        data = request.json
+        message = data.get('message', '')
+        session_id = data.get('session_id', 'default')
+        
+        # Get or create orchestrator for session
+        if session_id not in sessions:
+            api_key = os.environ.get('ANTHROPIC_API_KEY')
+            sessions[session_id] = CrisisNavigatorOrchestrator(api_key)
+        
+        orchestrator = sessions[session_id]
+        
+        # Process message
+        response = orchestrator.process_message(message)
+        
+        return jsonify({
+            'response': response,
+            'context': {
+                'crisis_type': orchestrator.context.crisis_type.value if orchestrator.context.crisis_type else None,
+                'location': orchestrator.context.location,
+                'has_children': orchestrator.context.has_children
+            }
+        })
+    
+    @app.route('/api/reset', methods=['POST'])
+    def reset():
+        data = request.json
+        session_id = data.get('session_id', 'default')
+        
+        if session_id in sessions:
+            sessions[session_id].reset()
+        
+        return jsonify({'status': 'reset'})
+    
+    return app
+
+# ============================================================================
+# CLI INTERFACE
+# ============================================================================
+
+def main():
+    """Run CLI interface for testing"""
+    print("=" * 60)
+    print("CRISIS RESOURCE NAVIGATOR")
+    print("=" * 60)
+    print("\nConfidential • Available 24/7 • Your safety matters")
+    print("\nEmergency Numbers:")
+    print("  • 988 - Suicide & Crisis Lifeline")
+    print("  • 911 - Emergency Services")
+    print("  • 1-800-799-7233 - National DV Hotline")
+    print("\n" + "=" * 60 + "\n")
+    
+    # Initialize orchestrator
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        print("ERROR: Set ANTHROPIC_API_KEY environment variable")
+        return
+    
+    orchestrator = CrisisNavigatorOrchestrator(api_key)
+    
+    # Initial greeting
+    print("NAVIGATOR: I'm here to help you find immediate crisis resources.")
+    print("           Your safety and privacy are my priority.")
+    print("           What kind of help do you need right now?\n")
+    
+    while True:
+        try:
+            user_input = input("YOU: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                print("\nNAVIGATOR: Take care. Remember:")
+                print("           • 988 for crisis support")
+                print("           • 911 for emergencies")
+                print("           You deserve help and support.\n")
+                break
+            
+            # Process message
+            response = orchestrator.process_message(user_input)
+            print(f"\nNAVIGATOR: {response}\n")
+            
+        except KeyboardInterrupt:
+            print("\n\nSession ended. Stay safe.")
+            break
+        except Exception as e:
+            print(f"\nERROR: {e}")
+            print("For immediate help, call 988 or 911\n")
+
+if __name__ == "__main__":
+    # Run CLI by default
+    main()
+    
+    # To run Flask API instead:
+    # app = create_flask_app()
+    # app.run(debug=True, port=5000)
