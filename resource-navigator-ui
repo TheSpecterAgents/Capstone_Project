@@ -1,0 +1,217 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, AlertCircle, Phone, MapPin, Clock, Shield } from 'lucide-react';
+
+const CrisisNavigator = () => {
+  const [messages, setMessages] = useState([
+    {
+      role: 'assistant',
+      content: "I'm here to help you find immediate crisis resources. Your safety and privacy are my priority. What kind of help do you need right now?",
+      timestamp: new Date()
+    }
+  ]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [location, setLocation] = useState('');
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const handleSend = async () => {
+    if (!input.trim()) return;
+
+    const userMessage = {
+      role: 'user',
+      content: input,
+      timestamp: new Date()
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      // Simulate API call to backend
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2000,
+          messages: [
+            ...messages.map(m => ({
+              role: m.role,
+              content: m.content
+            })),
+            { role: 'user', content: input }
+          ],
+          system: `You are a compassionate crisis resource navigator. Your role is to:
+1. Ask empathetic questions to understand the person's immediate needs
+2. Identify their location if not provided
+3. Determine crisis type (housing, domestic violence, mental health, addiction, food)
+4. Provide 2-3 specific, actionable local resources with phone numbers
+5. Always include a national crisis hotline as backup
+
+Be trauma-informed: never ask "why", focus on immediate safety, be direct and clear.
+Current conversation context: ${location ? `Location: ${location}` : 'Location unknown'}
+
+Format your response naturally. When providing resources, structure them clearly with:
+- Resource name
+- Phone number
+- Address/location
+- What to expect
+- Hours of operation
+
+Always end by asking if they need anything else or have questions.`
+        })
+      });
+
+      const data = await response.json();
+      const assistantMessage = {
+        role: 'assistant',
+        content: data.content[0].text,
+        timestamp: new Date()
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+
+      // Extract location if mentioned
+      const locationMatch = data.content[0].text.match(/(?:in|near|around)\s+([A-Z][a-zA-Z\s]+(?:,\s*[A-Z]{2})?)/);
+      if (locationMatch && !location) {
+        setLocation(locationMatch[1]);
+      }
+
+    } catch (error) {
+      const errorMessage = {
+        role: 'assistant',
+        content: "I'm having trouble connecting right now. For immediate help, please call:\n\n• 988 - Suicide & Crisis Lifeline\n• 911 - Emergency services\n• 1-800-799-7233 - National Domestic Violence Hotline",
+        timestamp: new Date()
+      };
+      setMessages(prev => [...prev, errorMessage]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const emergencyNumbers = [
+    { name: '988 - Suicide & Crisis Lifeline', number: '988', icon: Phone },
+    { name: '911 - Emergency Services', number: '911', icon: AlertCircle },
+    { name: 'Domestic Violence Hotline', number: '1-800-799-7233', icon: Shield }
+  ];
+
+  return (
+    <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      {/* Header */}
+      <div className="bg-white shadow-md p-4 border-b-4 border-indigo-500">
+        <h1 className="text-2xl font-bold text-indigo-900 flex items-center gap-2">
+          <Shield className="w-7 h-7" />
+          Crisis Resource Navigator
+        </h1>
+        <p className="text-sm text-gray-600 mt-1">Confidential • Available 24/7 • Your safety matters</p>
+      </div>
+
+      {/* Emergency Numbers Bar */}
+      <div className="bg-red-50 border-b border-red-200 p-3">
+        <div className="flex flex-wrap gap-3 justify-center text-sm">
+          {emergencyNumbers.map((emergency, idx) => (
+            <a
+              key={idx}
+              href={`tel:${emergency.number}`}
+              className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors"
+            >
+              <emergency.icon className="w-4 h-4" />
+              <span className="font-semibold">{emergency.name}</span>
+            </a>
+          ))}
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.map((message, idx) => (
+          <div
+            key={idx}
+            className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className={`max-w-3xl rounded-2xl px-6 py-4 shadow-md ${
+                message.role === 'user'
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-white text-gray-800 border border-gray-200'
+              }`}
+            >
+              <div className="whitespace-pre-wrap break-words">{message.content}</div>
+              <div
+                className={`text-xs mt-2 ${
+                  message.role === 'user' ? 'text-indigo-200' : 'text-gray-500'
+                }`}
+              >
+                {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {isLoading && (
+          <div className="flex justify-start">
+            <div className="bg-white rounded-2xl px-6 py-4 shadow-md border border-gray-200">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-indigo-600 rounded-full animate-bounce"></div>
+                <div className="w-2 h-2 bg-indigo-600 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                <div className="w-2 h-2 bg-indigo-600 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                <span className="ml-2 text-gray-600">Finding resources...</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input Area */}
+      <div className="bg-white border-t border-gray-200 p-4 shadow-lg">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex gap-3 items-end">
+            <div className="flex-1">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="Describe what you need help with..."
+                className="w-full p-4 border-2 border-gray-300 rounded-xl resize-none focus:border-indigo-500 focus:ring focus:ring-indigo-200 focus:outline-none"
+                rows="3"
+                disabled={isLoading}
+              />
+            </div>
+            <button
+              onClick={handleSend}
+              disabled={isLoading || !input.trim()}
+              className="bg-indigo-600 text-white p-4 rounded-xl hover:bg-indigo-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors shadow-md"
+            >
+              <Send className="w-6 h-6" />
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mt-2 text-center">
+            🔒 This conversation is private and not saved. Press Enter to send.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default CrisisNavigator;
